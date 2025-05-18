@@ -1,0 +1,795 @@
+/**
+ * @file paraSim
+ * @brief 串行线性规划求解器（SerialSolver）实现，支持标准单纯形法和两阶段法。
+ *
+ * 本文件实现了一个用于求解线性规划（Linear Programming, LP）问题的串行求解器类 SerialSolver。
+ * 支持带有不等式约束、等式约束、变量上下界的线性规划问题，自动处理最小化与最大化目标。
+ * 
+ * 主要特性：
+ * - 支持标准单纯形法与两阶段法，自动处理人工变量。
+ * - 支持不等式约束（Ax <= b）、等式约束（Aeq x = beq）、变量上下界（lb <= x <= ub）。
+ * - 详细的求解步骤记录与问题/答案摘要输出，便于调试与教学。
+ * - 结果结构体 LP_solution 包含最优解、目标值、状态、迭代次数、耗时等信息。
+ * - 代码结构清晰，便于扩展和集成。
+ *
+ * 主要接口：
+ * - SerialSolver::solve(...)：主入口，输入线性规划参数，返回 LP_solution 结构体。
+ * - LP_solution::print_data() / get_data_string()：输出问题与答案摘要。
+ *
+ * 适用范围：
+ * - 适用于教学、实验、工程中小规模线性规划问题的求解与分析。
+ * - 不依赖外部库，纯 C++ 实现，便于跨平台移植。
+ *
+ * 注意事项：
+ * - 仅适合中小规模问题（变量/约束数量较大时效率有限）。
+ * - 不支持整数规划、二次规划等扩展问题。
+ * - 代码中部分注释为中文，便于中文用户理解。
+ *
+ * 作者：fatri7
+ * 日期：2024
+ */
+#pragma once
+
+#include <vector>
+#include <iostream>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
+#include <algorithm>
+#include <string>
+#include <iomanip>
+#include <sstream>
+#include <chrono>
+
+// SerialSolver: 串行线性规划求解器，支持标准单纯形法和两阶段法
+class SerialSolver {
+public:
+    // LP_solution: 线性规划求解结果结构体
+    struct LP_solution {
+        std::vector<double> x;      // 最优解
+        double fval;                // 最优目标值
+        int exitflag;               // 退出标志 (1:成功, -1:无界/不可行)
+        std::string message;        // 状态信息
+        int iterations;             // 迭代次数
+        std::vector<std::string> steps; // 详细求解步骤
+        double total_time_ms = 0.0; // 求解总时间
+        std::vector<std::string> problem_data; // 问题描述
+        std::vector<std::string> answer_data;  // 答案摘要
+
+        // 输出问题数据和答案数据
+        void print_data() const {
+            for (const auto& line : problem_data) {
+                std::cout << line << "\n";
+            }
+        
+            for (const auto& line : answer_data) {
+                std::cout << line << "\n";
+            }
+        }
+
+        // 返回字符串形式的版本
+        std::string get_data_string() const {
+            std::string result;
+            for (const auto& line : problem_data) {
+                result += line + "\n";
+            }
+            for (const auto& line : answer_data) {
+                result += line + "\n";
+            }
+            return result;
+        }
+    };
+
+    // 求解线性规划问题 (支持最小化和最大化)
+    LP_solution solve(
+        const std::vector<double>& c,
+        const std::vector<std::vector<double>>& A,
+        const std::vector<double>& b,
+        const std::vector<std::vector<double>>& Aeq = {},
+        const std::vector<double>& beq = {},
+        const std::vector<double>& lb = {},
+        const std::vector<double>& ub = {},
+        bool is_maximization = false)
+    {
+        LP_solution result;
+        result.iterations = 0;
+        auto start_time = std::chrono::high_resolution_clock::now();
+
+        try {
+            // 打印线性规划问题形式
+            result.problem_data=print_LinearProgram_Form_(c, A, b, Aeq, beq, lb, ub, is_maximization);
+            // 如果需要最大化，转换目标函数系数
+            std::vector<double> adjusted_c = c;
+            if (is_maximization) {
+                for (auto& coeff : adjusted_c) {
+                    coeff = -coeff;
+                }
+            }
+
+            // 调用串行单纯形算法
+            std::vector<std::string> steps; // 不再使用详细步骤
+            bool success = linprog_(adjusted_c, A, b, Aeq, beq, lb, ub, 
+                                  result.x, result.fval, result.exitflag, 
+                                  result.iterations, steps, is_maximization);
+
+            // 如果是最大化问题，调整目标值
+            if (is_maximization && success) {
+                result.fval = -result.fval;
+            }
+
+            // 设置状态信息
+            if (result.exitflag == 1) {
+                result.message = "优化成功";
+            } else {
+                result.message = "问题无界或不可行";
+            }
+        } catch (const std::exception& e) {
+            result.exitflag = -1;
+            result.message = std::string("求解错误: ") + e.what();
+        }
+
+        auto end_time = std::chrono::high_resolution_clock::now();
+        result.total_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+        
+        // 打印简化结果,多线程冲突
+        result.answer_data=print_solution_summary_(result);
+
+        return result;
+    }
+
+private:
+    // 打印线性规划问题形式
+    std::vector<std::string> print_LinearProgram_Form_(
+        const std::vector<double>& c,
+        const std::vector<std::vector<double>>& A,
+        const std::vector<double>& b,
+        const std::vector<std::vector<double>>& Aeq,
+        const std::vector<double>& beq,
+        const std::vector<double>& lb = {},
+        const std::vector<double>& ub = {},
+        bool is_maximization = false) const 
+    {
+        std::vector<std::string> output;
+        output.push_back("\n============ 线性规划问题形式 ============\n");
+
+        // 确定变量数量
+        size_t num_vars = c.size();
+        if (num_vars == 0) {
+            output.push_back("错误: 目标函数系数为空\n");
+            return output;
+        }
+
+        // 构建目标函数字符串
+        std::string objective = "目标函数(" + std::string(is_maximization ? "max" : "min") + "): ";
+        bool first_term = true;
+        for (size_t i = 0; i < num_vars; ++i) {
+            if (c[i] != 0.0) {
+                if (!first_term) {
+                    objective += (c[i] >= 0 ? " + " : " - ");
+                } else {
+                    if (c[i] < 0) objective += "-";
+                    first_term = false;
+                }
+                objective += std::to_string(std::abs(c[i])) + "x" + std::to_string(i+1);
+            }
+        }
+        output.push_back(objective);
+
+        // 构建不等式约束字符串
+        if (!A.empty()) {
+            output.push_back("\n不等式约束 (" + std::to_string(A.size()) + " 个):");
+            for (size_t i = 0; i < A.size(); ++i) {
+                std::string constraint;
+                first_term = true;
+                for (size_t j = 0; j < num_vars; ++j) {
+                    if (A[i][j] != 0.0) {
+                        if (!first_term) {
+                            constraint += (A[i][j] >= 0 ? " + " : " - ");
+                        } else {
+                            if (A[i][j] < 0) constraint += "-";
+                            first_term = false;
+                        }
+                        constraint += std::to_string(std::abs(A[i][j])) + "x" + std::to_string(j+1);
+                    }
+                }
+                constraint += " ≤ " + std::to_string(b[i]);
+                output.push_back(constraint);
+            }
+        }
+
+        // 构建等式约束字符串
+        if (!Aeq.empty()) {
+            output.push_back("\n等式约束 (" + std::to_string(Aeq.size()) + " 个):");
+            for (size_t i = 0; i < Aeq.size(); ++i) {
+                std::string constraint;
+                first_term = true;
+                for (size_t j = 0; j < num_vars; ++j) {
+                    if (Aeq[i][j] != 0.0) {
+                        if (!first_term) {
+                            constraint += (Aeq[i][j] >= 0 ? " + " : " - ");
+                        } else {
+                            if (Aeq[i][j] < 0) constraint += "-";
+                            first_term = false;
+                        }
+                        constraint += std::to_string(std::abs(Aeq[i][j])) + "x" + std::to_string(j+1);
+                    }
+                }
+                constraint += " = " + std::to_string(beq[i]);
+                output.push_back(constraint);
+            }
+        }
+
+        // 构建边界约束字符串
+        output.push_back("\n边界条件 (" + std::to_string(num_vars) + " 个变量):");
+        for (size_t i = 0; i < num_vars; ++i) {
+            double lower = lb.empty() ? 0.0 : (i < lb.size() ? lb[i] : 0.0);
+            double upper = ub.empty() ? std::numeric_limits<double>::infinity() : 
+                                     (i < ub.size() ? ub[i] : std::numeric_limits<double>::infinity());
+            
+            std::string bound = "x" + std::to_string(i+1) + ": ";
+            if (upper == std::numeric_limits<double>::infinity()) {
+                bound += std::to_string(lower) + " ≤ x" + std::to_string(i+1) + " ≤ +∞";
+            } else {
+                bound += std::to_string(lower) + " ≤ x" + std::to_string(i+1) + " ≤ " + std::to_string(upper);
+            }
+            output.push_back(bound);
+        }
+
+        output.push_back("========================================");
+        return output;
+    }
+
+    // 打印求解摘要
+    std::vector<std::string> print_solution_summary_(const LP_solution& result) const {
+        std::vector<std::string> output;
+        std::ostringstream oss;
+        
+        output.push_back("\n============ 求解结果 ============");
+        output.push_back("状态: " + result.message);
+        oss << "迭代次数: " << result.iterations;
+        output.push_back(oss.str());
+        oss.str(""); // 清空流
+        
+        oss << "求解时间: " << result.total_time_ms << " 毫秒";
+        output.push_back(oss.str());
+        oss.str("");
+        
+        if (result.exitflag == 1) {
+            oss << std::fixed << std::setprecision(6);
+            oss << "最优目标值: " << result.fval;
+            output.push_back(oss.str());
+            oss.str("");
+            
+            std::string solution_str = "最优解: [";
+            for (size_t i = 0; i < result.x.size(); ++i) {
+                if (i != 0) solution_str += ", ";
+                oss << std::fixed << std::setprecision(6) << result.x[i];
+                solution_str += oss.str();
+                oss.str("");
+            }
+            solution_str += "]";
+            output.push_back(solution_str);
+        }
+        
+        output.push_back("================================");
+        return output;
+    }
+
+    // 线性规划求解函数 (返回是否成功)
+    bool linprog_(
+        const std::vector<double>& c,
+        const std::vector<std::vector<double>>& A,
+        const std::vector<double>& b,
+        const std::vector<std::vector<double>>& Aeq,
+        const std::vector<double>& beq,
+        const std::vector<double>& lb,
+        const std::vector<double>& ub,
+        std::vector<double>& x,
+        double& fval,
+        int& exitflag,
+        int& iteration_count,
+        std::vector<std::string>& steps,
+        bool is_maximization)
+    {
+        // 检查输入维度
+        size_t num_vars = c.size();
+        if (num_vars == 0) {
+            throw std::invalid_argument("目标函数系数向量不能为空");
+        }
+
+        steps.push_back("开始问题标准化处理...");
+
+        // 处理边界约束
+        std::vector<double> effective_lb = lb;
+        std::vector<double> effective_ub = ub;
+        if (effective_lb.empty()) {
+            effective_lb.resize(num_vars, -std::numeric_limits<double>::infinity());
+        }
+        if (effective_ub.empty()) {
+            effective_ub.resize(num_vars, std::numeric_limits<double>::infinity());
+        }
+
+        // 将问题转化为标准形式
+        std::vector<std::vector<double>> tableau;
+        std::vector<int> basis;
+        bool convert_success = convert_to_standardForm_(
+            c, A, b, Aeq, beq, effective_lb, effective_ub, 
+            tableau, basis, steps, x, fval, exitflag, is_maximization);
+        
+        if (!convert_success) {
+            return false;
+        }
+
+        // 打印初始单纯形表
+        steps.push_back("初始单纯形表构造完成");
+        steps.push_back(format_tableau_("初始单纯形表", tableau, basis));
+
+        // 计算人工变量数量
+        size_t num_artificial = 0;
+        if (!Aeq.empty()) {
+            num_artificial = Aeq.size();
+        }
+
+        // 执行单纯形算法
+        bool success = simplex_method_(
+            tableau, basis, iteration_count, steps,
+            num_vars,
+            A.size(), // num_slack
+            num_vars + A.size(), // artificial_start
+            num_artificial
+        );
+
+        if (success) {
+            steps.push_back("单纯形算法成功收敛");
+            extract_solution_(tableau, basis, num_vars, x, fval, c, steps, A, b, Aeq, beq);
+            
+            // 严格可行性检查
+            bool is_feasible = true;
+            const double epsilon = 1e-6;
+            
+            // 检查松弛变量非负
+            for (size_t i = 0; i < basis.size(); ++i) {
+                if (basis[i] >= static_cast<int>(num_vars)) {
+                    double value = tableau[i].back();
+                    if (value < -epsilon) {
+                        steps.push_back("不可行：松弛变量x" + std::to_string(basis[i]) + 
+                                      " = " + std::to_string(value) + " < 0");
+                        is_feasible = false;
+                    }
+                }
+            }
+            
+            // 检查原始约束
+            if (is_feasible) {
+                // 检查不等式约束 Ax <= b
+                for (size_t i = 0; i < A.size(); ++i) {
+                    double sum = 0.0;
+                    for (size_t j = 0; j < num_vars; ++j) {
+                        sum += A[i][j] * x[j];
+                    }
+                    if (sum > b[i] + epsilon) {
+                        steps.push_back("违反不等式约束 " + std::to_string(i+1) + 
+                                      ": " + std::to_string(sum) + " > " + std::to_string(b[i]));
+                        is_feasible = false;
+                    }
+                }
+                
+                // 检查等式约束 Aeq x = beq
+                for (size_t i = 0; i < Aeq.size(); ++i) {
+                    double sum = 0.0;
+                    for (size_t j = 0; j < num_vars; ++j) {
+                        sum += Aeq[i][j] * x[j];
+                    }
+                    if (std::abs(sum - beq[i]) > epsilon) {
+                        steps.push_back("违反等式约束 " + std::to_string(i+1) + 
+                                      ": " + std::to_string(sum) + " ≠ " + std::to_string(beq[i]));
+                        is_feasible = false;
+                    }
+                }
+            }
+            
+            if (!is_feasible) {
+                steps.push_back("警告：解不满足原始约束！");
+                exitflag = -2;
+                x.assign(num_vars, 0.0);
+                fval = is_maximization ? -std::numeric_limits<double>::infinity() 
+                                     : std::numeric_limits<double>::infinity();
+                return false;
+            }
+            
+            exitflag = 1;
+        } else {
+            steps.push_back("单纯形算法检测到问题无界或不可行");
+            x.assign(num_vars, 0.0);
+            fval = is_maximization ? -std::numeric_limits<double>::infinity() 
+                                 : std::numeric_limits<double>::infinity();
+            exitflag = -1;
+        }
+
+        return success;
+    }
+
+    // 格式化单纯形表为字符串
+    static std::string format_tableau_(const std::string& title, 
+                                     const std::vector<std::vector<double>>& tableau,
+                                     const std::vector<int>& basis = {}) 
+    {
+        std::ostringstream oss;
+        oss << "\n" << title << " (" << tableau.size() << "行 × " 
+            << (tableau.empty() ? 0 : tableau[0].size()) << "列):\n";
+        
+        const int width = 12;
+        const int prec = 6;
+        
+        // 打印列标题
+        if (!tableau.empty()) {
+            size_t cols = tableau[0].size();
+            oss << std::setw(width) << " Basis |";
+            for (size_t j = 0; j < cols - 1; ++j) {
+                oss << std::setw(width) << "x" << j;
+            }
+            oss << std::setw(width) << "RHS" << "\n";
+        }
+        
+        // 打印每一行
+        for (size_t i = 0; i < tableau.size(); ++i) {
+            // 打印基变量
+            if (i < basis.size()) {
+                oss << std::setw(width-3) << "x" << basis[i] << " |";
+            } else if (i == tableau.size() - 1) {
+                oss << std::setw(width-3) << "Obj" << " |";
+            } else {
+                oss << std::setw(width) << " |";
+            }
+            
+            // 打印数值
+            for (double val : tableau[i]) {
+                if (std::abs(val) < 1e-10) val = 0.0;
+                oss << std::setw(width) << std::fixed << std::setprecision(prec) << val;
+            }
+            oss << "\n";
+        }
+        
+        return oss.str();
+    }
+
+    // 辅助函数：检查变量是否为人工变量
+    static bool is_artificial_var(int var_idx, 
+                                size_t num_vars, 
+                                size_t num_slack,
+                                size_t artificial_start,
+                                size_t num_artificial) {
+        return var_idx >= static_cast<int>(artificial_start) && 
+               var_idx < static_cast<int>(artificial_start + num_artificial);
+    }
+
+    // 将线性规划问题转化为标准形式
+    bool convert_to_standardForm_(
+        const std::vector<double>& c,
+        const std::vector<std::vector<double>>& A,
+        const std::vector<double>& b,
+        const std::vector<std::vector<double>>& Aeq,
+        const std::vector<double>& beq,
+        const std::vector<double>& lb,
+        const std::vector<double>& ub,
+        std::vector<std::vector<double>>& tableau,
+        std::vector<int>& basis,
+        std::vector<std::string>& steps,
+        std::vector<double>& x, 
+        double& fval,
+        int& exitflag,
+        bool is_maximization) 
+    {
+        size_t num_vars = c.size();
+        size_t num_ineq = A.empty() ? 0 : A.size();
+        size_t num_eq = Aeq.empty() ? 0 : Aeq.size();
+        size_t num_slack = num_ineq; 
+
+        // 第一步：计算需要的人工变量
+        std::vector<bool> needs_artificial(num_eq, false);
+        std::vector<int> basis_candidates(num_eq, -1);
+        
+        for (size_t i = 0; i < num_eq; ++i) {
+            bool found_basis = false;
+            for (size_t j = 0; j < Aeq[i].size(); ++j) {
+                if (std::abs(Aeq[i][j] - 1.0) < 1e-6) {
+                    bool is_unique = true;
+                    for (size_t k = 0; k < num_eq; ++k) {
+                        if (k != i && std::abs(Aeq[k][j]) > 1e-6) {
+                            is_unique = false;
+                            break;
+                        }
+                    }
+                    if (is_unique) {
+                        basis_candidates[i] = j;
+                        found_basis = true;
+                        break;
+                    }
+                }
+            }
+            needs_artificial[i] = !found_basis;
+        }
+        
+        size_t num_artificial = std::count(needs_artificial.begin(), needs_artificial.end(), true);
+
+        // 第二步：构造单纯形表
+        size_t total_vars = num_vars + num_slack + num_artificial;
+        tableau.resize(num_eq + num_ineq + 1, std::vector<double>(total_vars + 1, 0.0));
+
+        // 处理不等式约束（添加松弛变量）
+        for (size_t i = 0; i < num_ineq; ++i) {
+            size_t row = num_eq + i;
+            for (size_t j = 0; j < num_vars; ++j) {
+                tableau[row][j] = A[i][j];
+            }
+            tableau[row][num_vars + i] = 1.0;  // 松弛变量
+            tableau[row].back() = b[i];
+        }
+
+        // 处理等式约束（按需添加人工变量）
+        size_t artificial_pos = num_vars + num_slack;
+        basis.resize(num_eq + num_ineq);
+        for (size_t i = 0; i < num_eq; ++i) {
+            for (size_t j = 0; j < num_vars; ++j) {
+                tableau[i][j] = Aeq[i][j];
+            }
+            tableau[i].back() = beq[i];
+
+            if (needs_artificial[i]) {
+                tableau[i][artificial_pos] = 1.0;
+                basis[i] = artificial_pos++;
+            } else {
+                basis[i] = basis_candidates[i];
+            }
+        }
+        for (size_t i = 0; i < num_ineq; ++i) {
+            basis[num_eq + i] = num_vars + i;  // 松弛变量作为基
+        }
+
+        // 两阶段法处理
+        if (num_artificial > 0) {
+            // 添加第一阶段目标函数行
+            tableau.push_back(std::vector<double>(total_vars + 1, 0.0));
+            for (size_t i = 0; i < num_eq; ++i) {
+                if (needs_artificial[i]) {
+                    for (size_t j = 0; j <= total_vars; ++j) {
+                        tableau.back()[j] -= tableau[i][j];
+                    }
+                }
+            }
+
+            // 执行第一阶段单纯形法
+            int phase1_iter = 0;
+            std::vector<std::string> phase1_steps;
+            bool phase1_success = simplex_method_(tableau, basis, phase1_iter, phase1_steps,
+                                               num_vars, num_slack, num_vars+num_slack, num_artificial);
+            steps.insert(steps.end(), phase1_steps.begin(), phase1_steps.end());
+
+            // 检查第一阶段结果
+            bool is_feasible = true;
+            for (size_t i = 0; i < num_eq; ++i) {
+                if (needs_artificial[i] && std::abs(tableau[i].back()) > 1e-6) {
+                    is_feasible = false;
+                    break;
+                }
+            }
+
+            if (!phase1_success || !is_feasible) {
+                steps.push_back("第一阶段失败：问题不可行");
+                exitflag = -1;
+                return false;
+            }
+
+            // 移除人工变量列
+            for (auto& row : tableau) {
+                row.erase(row.begin() + num_vars + num_slack, 
+                         row.begin() + num_vars + num_slack + num_artificial);
+            }
+            tableau.pop_back();  // 移除第一阶段目标行
+            total_vars -= num_artificial;
+        }
+
+        // 设置最终目标函数
+        for (size_t j = 0; j < num_vars; ++j) {
+            tableau.back()[j] = c[j];
+        }
+        return true;
+    }
+
+    // 串行执行单纯形算法
+    bool simplex_method_(
+        std::vector<std::vector<double>>& tableau,
+        std::vector<int>& basis,
+        int& iteration_count,
+        std::vector<std::string>& steps,
+        size_t num_vars,
+        size_t num_slack,
+        size_t artificial_start,
+        size_t num_artificial)
+    {
+        const double epsilon = 1e-8;
+        size_t num_rows = tableau.size() - 1;
+        if (num_rows == 0) return false;
+        
+        size_t num_cols = tableau[0].size() - 1;
+        iteration_count = 0;
+        const int max_iterations = 1000;
+
+        while (iteration_count < max_iterations) {
+            iteration_count++;
+
+            // 1. 寻找入基变量
+            int pivot_col = -1;
+            double min_coeff = 0.0;
+            for (size_t j = 0; j < num_cols; ++j) {
+                double val = tableau.back()[j];
+                if (val < min_coeff - epsilon && 
+                    !is_artificial_var(j, num_vars, num_slack, artificial_start, num_artificial)) {
+                    min_coeff = val;
+                    pivot_col = j;
+                }
+            }
+
+            // 2. 终止条件检查
+            if (pivot_col == -1) {
+                bool feasible = true;
+                for (size_t i = 0; i < num_rows; ++i) {
+                    if (tableau[i].back() < -epsilon) {
+                        feasible = false;
+                        break;
+                    }
+                }
+                return feasible;
+            }
+
+            // 3. 寻找出基变量
+            int pivot_row = -1;
+            double min_ratio = std::numeric_limits<double>::infinity();
+            for (size_t i = 0; i < num_rows; ++i) {
+                double val = tableau[i][pivot_col];
+                if (val > epsilon) {
+                    double ratio = tableau[i].back() / val;
+                    if (ratio < min_ratio - epsilon) {
+                        min_ratio = ratio;
+                        pivot_row = i;
+                    }
+                }
+            }
+
+            // 4. 处理无界情况
+            if (pivot_row == -1) {
+                steps.push_back("问题无界");
+                return false;
+            }
+
+            // 5. 主元消去
+            double pivot_val = tableau[pivot_row][pivot_col];
+            for (size_t j = 0; j < tableau[pivot_row].size(); ++j) {
+                tableau[pivot_row][j] /= pivot_val;
+            }
+
+            for (size_t i = 0; i < tableau.size(); ++i) {
+                if (i != static_cast<size_t>(pivot_row)) {
+                    double factor = tableau[i][pivot_col];
+                    for (size_t j = 0; j < tableau[i].size(); ++j) {
+                        tableau[i][j] -= factor * tableau[pivot_row][j];
+                    }
+                }
+            }
+
+            // 6. 更新基变量
+            basis[pivot_row] = pivot_col;
+        }
+
+        steps.push_back("达到最大迭代次数");
+        return false;
+    }
+
+    // 从单纯形表中提取解
+    void extract_solution_(
+        const std::vector<std::vector<double>>& tableau,
+        const std::vector<int>& basis,
+        size_t num_vars,
+        std::vector<double>& x,
+        double& fval,
+        const std::vector<double>& original_c,
+        std::vector<std::string>& steps,
+        const std::vector<std::vector<double>>& A,
+        const std::vector<double>& b,
+        const std::vector<std::vector<double>>& Aeq,
+        const std::vector<double>& beq)
+    {
+        // 初始化解向量
+        x.assign(num_vars, 0.0);
+        size_t num_rows = tableau.size() - 1;
+
+        // 1. 提取基变量值
+        steps.push_back("开始提取基变量解...");
+        for (size_t i = 0; i < num_rows; ++i) {
+            if (basis[i] < static_cast<int>(num_vars)) {
+                x[basis[i]] = tableau[i].back();
+                steps.push_back("x" + std::to_string(basis[i]) + " = " + 
+                              std::to_string(tableau[i].back()));
+            }
+        }
+
+        // 2. 计算原始目标值
+        fval = 0.0;
+        for (size_t j = 0; j < num_vars; ++j) {
+            fval += original_c[j] * x[j];
+        }
+        steps.push_back("计算原始目标函数值: " + std::to_string(fval));
+
+        // 3. 严格可行性验证
+        bool is_feasible = true;
+        const double epsilon = 1e-6;
+
+        // 3.1 检查边界约束
+        for (size_t j = 0; j < num_vars; ++j) {
+            if (x[j] < -epsilon) {
+                steps.push_back("违反非负约束: x" + std::to_string(j) + 
+                              " = " + std::to_string(x[j]) + " < 0");
+                is_feasible = false;
+            }
+        }
+
+        // 3.2 检查不等式约束 Ax <= b
+        for (size_t i = 0; i < A.size(); ++i) {
+            double constraint_value = 0.0;
+            for (size_t j = 0; j < num_vars; ++j) {
+                constraint_value += A[i][j] * x[j];
+            }
+            if (constraint_value > b[i] + epsilon) {
+                steps.push_back("违反不等式约束 " + std::to_string(i+1) + ": " +
+                              std::to_string(constraint_value) + " > " + 
+                              std::to_string(b[i]));
+                is_feasible = false;
+            }
+        }
+
+        // 3.3 检查等式约束 Aeq x = beq
+        for (size_t i = 0; i < Aeq.size(); ++i) {
+            double constraint_value = 0.0;
+            for (size_t j = 0; j < num_vars; ++j) {
+                constraint_value += Aeq[i][j] * x[j];
+            }
+            if (std::abs(constraint_value - beq[i]) > epsilon) {
+                steps.push_back("违反等式约束 " + std::to_string(i+1) + ": " +
+                              std::to_string(constraint_value) + " ≠ " + 
+                              std::to_string(beq[i]));
+                is_feasible = false;
+            }
+        }
+
+        // 3.4 检查松弛变量非负
+        for (size_t i = 0; i < basis.size(); ++i) {
+            if (basis[i] >= static_cast<int>(num_vars)) {
+                double slack_value = tableau[i].back();
+                if (slack_value < -epsilon) {
+                    steps.push_back("松弛变量x" + std::to_string(basis[i]) + 
+                                  " = " + std::to_string(slack_value) + " < 0");
+                    is_feasible = false;
+                }
+            }
+        }
+
+        if (!is_feasible) {
+            steps.push_back("警告：解不满足原始约束条件！");
+            throw std::runtime_error("不可行解");
+        }
+
+        // 4. 特殊处理人工变量
+        bool has_artificial = false;
+        for (int var : basis) {
+            if (var >= static_cast<int>(num_vars + A.size())) {
+                has_artificial = true;
+                break;
+            }
+        }
+
+        if (has_artificial) {
+            steps.push_back("警告：基中仍含人工变量");
+            throw std::runtime_error("人工变量未消除");
+        }
+    }
+};

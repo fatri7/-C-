@@ -1,0 +1,208 @@
+/**
+ * @file ThreadPool
+ * @brief 支持任务优先级调度的 C++ 线程池实现。
+ *
+ * 本文件实现了一个高效的线程池类 ThreadPool，支持多线程并发执行任务，并允许为每个任务指定优先级。
+ * 
+ * 主要特性：
+ * - 支持多线程并发执行，线程数量可动态调整（resize）。
+ * - 任务可指定优先级（Urgent/High/Normal/Low 或自定义 int），高优先级任务优先调度。
+ * - 提供多种 submit 接口，支持普通、带优先级、紧急任务提交。
+ * - 线程安全，支持任务等待（wait_all）与线程池安全关闭。
+ * - 支持获取待处理任务数（pending_tasks）。
+ *
+ * 主要接口：
+ * - ThreadPool::submit(...)：提交任务，支持不同优先级和参数形式。
+ * - ThreadPool::resize(size_t)：动态调整线程池线程数量。
+ * - ThreadPool::wait_all()：等待所有任务完成。
+ * - ThreadPool::pending_tasks()：获取当前待处理任务数。
+ *
+ * 适用范围：
+ * - 适用于需要高效任务调度和优先级控制的多线程场景，如服务器、并行计算、后台任务处理等。
+ * - 纯 C++ 实现，依赖标准库，易于集成和移植。
+ *
+ * 注意事项：
+ * - 线程池关闭时会等待所有任务完成，确保资源安全释放。
+ * - 任务函数需保证异常安全，避免影响线程池稳定性。
+ * - 不支持任务取消、暂停等高级特性。
+ *
+ * 作者：fatri7
+ * 日期：2024
+ */
+#pragma once
+#include <thread>
+#include <condition_variable>
+#include <mutex>
+#include <vector>
+#include <queue>
+#include <future>
+#include <atomic>
+#include <functional>
+#include <type_traits>
+
+// 线程池类：支持任务优先级调度的线程池实现
+class ThreadPool {
+public:
+    // 优先级分组枚举
+    enum class Priority {
+        Urgent = 100,   // 紧急任务（最高优先级）
+        High = 50,      // 高优先级
+        Normal = 0,     // 默认优先级
+        Low = -50       // 低优先级
+    };
+
+private:
+    // 任务结构体，包含任务函数和优先级
+    struct Task {
+        std::function<void()> func; // 任务函数
+        int priority = 0;           // 任务优先级
+        // 优先队列比较，priority值大的优先
+        bool operator<(const Task& rhs) const {
+            return priority < rhs.priority;
+        }
+    };
+
+    std::atomic<bool> m_stop{false};         // 线程池停止标志
+    std::vector<std::thread> m_threads;      // 工作线程容器
+    std::priority_queue<Task> m_tasks;       // 任务优先队列
+    mutable std::mutex m_mutex;              // 互斥锁保护任务队列和状态
+    std::condition_variable m_cv;            // 条件变量用于线程同步
+    std::atomic<size_t> m_pending_tasks{0};  // 待处理任务计数
+
+public:
+    // 构造函数，初始化线程池并启动指定数量线程
+    explicit ThreadPool(size_t thread_count = std::thread::hardware_concurrency()) {
+        resize(thread_count ? thread_count : 1);
+    }
+
+    // 析构函数，安全关闭线程池
+    ~ThreadPool() {
+        shutdown();
+    }
+
+    // 禁止拷贝和移动
+    ThreadPool(const ThreadPool&) = delete;
+    ThreadPool(ThreadPool&&) = delete;
+    ThreadPool& operator=(const ThreadPool&) = delete;
+    ThreadPool& operator=(ThreadPool&&) = delete;
+
+    // 提交普通优先级任务
+    template<typename F, typename... Args>
+    auto submit(F&& f, Args&&... args) -> std::future<decltype(f(args...))> {
+        return submit_impl(static_cast<int>(Priority::Normal), std::forward<F>(f), std::forward<Args>(args)...);
+    }
+
+    // 提交自定义优先级任务
+    template<typename F, typename... Args>
+    auto submit(int priority, F&& f, Args&&... args) -> std::future<decltype(f(args...))> {
+        return submit_impl(priority, std::forward<F>(f), std::forward<Args>(args)...);
+    }
+
+    // 提交枚举优先级任务
+    template<typename F, typename... Args>
+    auto submit(Priority priority, F&& f, Args&&... args) -> std::future<decltype(f(args...))> {
+        return submit_impl(static_cast<int>(priority), std::forward<F>(f), std::forward<Args>(args)...);
+    }
+
+    // 提交紧急任务
+    template<typename F, typename... Args>
+    auto submit_urgent(F&& f, Args&&... args) -> std::future<decltype(f(args...))> {
+        return submit_impl(static_cast<int>(Priority::Urgent), std::forward<F>(f), std::forward<Args>(args)...);
+    }
+
+    // 动态调整线程池线程数量
+    void resize(size_t new_size) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        size_t cur = m_threads.size();
+        if (new_size > cur) {
+            // 增加线程
+            for (size_t i = 0; i < new_size - cur; ++i) {
+                m_threads.emplace_back([this] { worker_thread(); });
+            }
+        } else if (new_size < cur) {
+            // 减少线程，通过提交特殊任务让线程退出
+            for (size_t i = 0; i < cur - new_size; ++i) {
+                submit_impl(static_cast<int>(Priority::Urgent), [this] { m_stop = true; });
+            }
+        }
+    }
+
+    // 等待所有任务完成
+    void wait_all() {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_cv.wait(lock, [this] { return m_pending_tasks == 0 && m_tasks.empty(); });
+    }
+
+    // 获取当前待处理任务数
+    size_t pending_tasks() const {
+        return m_pending_tasks.load();
+    }
+
+private:
+    // 任务提交实现，支持优先级
+    template<typename F, typename... Args>
+    auto submit_impl(int priority, F&& f, Args&&... args) -> std::future<decltype(f(args...))> {
+        using RetType = decltype(f(args...));
+        // 创建可调用任务对象
+        auto task_ptr = std::make_shared<std::packaged_task<RetType()>>(
+            std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+        );
+        std::future<RetType> fut = task_ptr->get_future();
+
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_stop)
+                throw std::runtime_error("ThreadPool is stopped");
+            // 将任务加入优先队列
+            m_tasks.push(Task{
+                [task_ptr]() { (*task_ptr)(); },
+                priority
+            });
+            ++m_pending_tasks;
+        }
+        m_cv.notify_one(); // 唤醒一个工作线程
+        return fut;
+    }
+
+    // 工作线程主循环
+    void worker_thread() {
+        while (true) {
+            Task task;
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                // 等待有任务或线程池停止
+                m_cv.wait(lock, [this] { return m_stop || !m_tasks.empty(); });
+                if (m_stop && m_tasks.empty())
+                    return; // 线程池关闭且无任务，退出线程
+                if (!m_tasks.empty()) {
+                    // 取出优先级最高的任务
+                    task = std::move(const_cast<Task&>(m_tasks.top()));
+                    m_tasks.pop();
+                } else {
+                    continue;
+                }
+            }
+            try {
+                task.func(); // 执行任务
+            } catch (...) {
+                // 捕获并吞掉异常，防止线程崩溃
+            }
+            --m_pending_tasks; // 任务计数递减
+            m_cv.notify_all(); // 通知等待任务完成的线程
+        }
+    }
+
+    // 关闭线程池，等待所有线程退出
+    void shutdown() {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stop = true;
+        }
+        m_cv.notify_all(); // 唤醒所有线程
+        for (auto& t : m_threads) {
+            if (t.joinable())
+                t.join(); // 等待线程退出
+        }
+        m_threads.clear();
+    }
+};

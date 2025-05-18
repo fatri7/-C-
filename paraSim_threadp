@@ -1,0 +1,135 @@
+/**
+ * @file paraSim_threadp
+ * @brief 并行线性规划求解器（ParallelSolver）实现，基于线程池支持批量与单个问题的多线程求解。
+ *
+ * 本文件实现了一个用于并行求解线性规划（Linear Programming, LP）问题的求解器类 ParallelSolver。
+ * 该类封装线程池（ThreadPool），可高效地批量或单独并行求解多个线性规划问题，自动利用多核CPU提升性能。
+ * 
+ * 主要特性：
+ * - 支持批量提交多个线性规划问题，并行计算，自动收集所有结果。
+ * - 支持单个问题的异步求解，利用线程池资源。
+ * - 可查询当前线程池的待处理任务数和线程数（需ThreadPool支持）。
+ * - 依赖SerialSolver类实现具体的线性规划求解逻辑。
+ *
+ * 主要接口：
+ * - ParallelSolver::solve_batch(...)：批量并行求解多个LP问题。
+ * - ParallelSolver::solve(...)：并行求解单个LP问题。
+ * - pending_tasks()/thread_count()：查询线程池状态。
+ *
+ * 适用范围：
+ * - 适用于需要高效批量求解线性规划问题的场景。
+ * - 结合SerialSolver使用，适合中小规模问题的并行加速。
+ *
+ * 注意事项：
+ * - 线程池ThreadPool需实现submit、pending_tasks等接口。
+ * - 若需获取线程池线程数，ThreadPool需实现相关方法。
+ * - 仅适合中小规模问题（变量/约束数量较大时效率有限）。
+ *
+ * 作者：fatri7
+ * 日期：2024
+ */
+#pragma once
+#include <vector>
+#include <future>
+#include "ThreadPool"
+#include "paraSim"
+
+/**
+ * @class ParallelSolver
+ * @brief 并行线性规划求解器，封装线程池，支持批量和单个问题的多线程求解。
+ */
+class ParallelSolver {
+public:
+    /**
+     * @brief 构造函数，初始化线程池
+     * @param thread_count 线程池线程数，默认使用硬件并发数
+     */
+    explicit ParallelSolver(size_t thread_count = std::thread::hardware_concurrency())
+        : pool_(thread_count) {}
+
+    /**
+     * @brief 批量并行求解多个线性规划问题
+     * @param problems 线性规划问题参数的tuple数组
+     * @return 每个问题的求解结果数组
+     */
+    std::vector<SerialSolver::LP_solution> solve_batch(
+        const std::vector<std::tuple<
+            std::vector<double>,                     // c
+            std::vector<std::vector<double>>,        // A
+            std::vector<double>,                     // b
+            std::vector<std::vector<double>>,        // Aeq (可选)
+            std::vector<double>,                     // beq (可选)
+            std::vector<double>,                     // lb (可选)
+            std::vector<double>,                     // ub (可选)
+            bool                                     // is_maximization (可选)
+        >>& problems)
+    {
+        std::vector<std::future<SerialSolver::LP_solution>> futures;
+        futures.reserve(problems.size());
+        // 提交所有任务到线程池
+        for (const auto& problem : problems) {
+            futures.emplace_back(
+                pool_.submit([problem] {
+                    SerialSolver solver;
+                    // 使用std::apply解包tuple参数并调用solve
+                    return std::apply([&solver](auto&&... args) {
+                        return solver.solve(std::forward<decltype(args)>(args)...);
+                    }, problem);
+                })
+            );
+        }
+
+        // 收集所有结果
+        std::vector<SerialSolver::LP_solution> results;
+        results.reserve(problems.size());
+        for (auto& future : futures) {
+            results.push_back(future.get());
+        }
+        return results;
+    }
+
+    /**
+     * @brief 并行求解单个线性规划问题
+     * @param c 目标函数系数
+     * @param A 不等式约束矩阵
+     * @param b 不等式约束右端
+     * @param Aeq 等式约束矩阵
+     * @param beq 等式约束右端
+     * @param lb 变量下界
+     * @param ub 变量上界
+     * @param is_maximization 是否为最大化问题
+     * @return 求解结果
+     */
+    SerialSolver::LP_solution solve(
+        const std::vector<double>& c,
+        const std::vector<std::vector<double>>& A,
+        const std::vector<double>& b,
+        const std::vector<std::vector<double>>& Aeq = {},
+        const std::vector<double>& beq = {},
+        const std::vector<double>& lb = {},
+        const std::vector<double>& ub = {},
+        bool is_maximization = false)
+    {
+        // 提交单个任务到线程池并等待结果
+        auto future = pool_.submit([=] {
+            SerialSolver solver;
+            return solver.solve(c, A, b, Aeq, beq, lb, ub, is_maximization);
+        });
+        return future.get();
+    }
+
+    /**
+     * @brief 获取线程池中待处理任务数
+     * @return 待处理任务数
+     */
+    size_t pending_tasks() const { return pool_.pending_tasks(); }
+
+    /**
+     * @brief 获取线程池线程数（需ThreadPool实现该方法）
+     * @return 线程池线程数
+     */
+    size_t thread_count() const { return pool_.pending_tasks(); }
+
+private:
+    ThreadPool pool_; ///< 线程池实例
+};
