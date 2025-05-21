@@ -11,7 +11,7 @@
  * - 支持并行/串行求解模式切换
  * - 提供详细的求解统计信息
  * - 完善的异常处理机制
- *
+ * - 保存成功解答的答案与问题到txt文件
  * 使用方式：
  *   ./unified_lp_solver [--parallel|--serial] [--threads N] [--file filename]
  *
@@ -28,6 +28,7 @@
 #include <iomanip>
 #include <string>
 #include <algorithm>
+#include <fstream>
 #include "json.hpp"
 #include "paraSim_threadp"  // 并行求解器
 #include "paraSim"         // 串行求解器
@@ -96,17 +97,20 @@ SolverStatistics solve_parallel(const std::vector<LP_Problem>& problems, int thr
     auto end_time = std::chrono::high_resolution_clock::now();
     stats.wall_clock_time_ms = 
         std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-
+    std::string file_path = "answer_parallel.txt";
+    std::ofstream out_file(file_path, std::ios::app);
+    assert(out_file.is_open());
     for (const auto& result : results) {
         if (result.exitflag == 1) {
             stats.success_count++;
+            out_file << result.get_data_string();
         } else {
             stats.fail_count++;
         }
         stats.total_iterations += result.iterations;
         stats.total_solve_time_ms += result.total_time_ms;
     }
-
+    out_file.close();
     return stats;
 }
 
@@ -130,16 +134,20 @@ SolverStatistics solve_serial(const std::vector<LP_Problem>& problems) {
     stats.wall_clock_time_ms = 
         std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
 
+    std::string file_path = "answer_serial.txt";
+    std::ofstream out_file(file_path, std::ios::app);
+    assert(out_file.is_open());
     for (const auto& result : results) {
         if (result.exitflag == 1) {
             stats.success_count++;
+            out_file << result.get_data_string();
         } else {
             stats.fail_count++;
         }
         stats.total_iterations += result.iterations;
         stats.total_solve_time_ms += result.total_time_ms;
     }
-
+    out_file.close();
     return stats;
 }
 
@@ -161,13 +169,16 @@ void print_statistics(const SolverStatistics& stats, bool is_parallel, int threa
     
     if (is_parallel) {
         std::cout << "并行加速比: " << std::fixed << std::setprecision(2) 
-                  << stats.total_solve_time_ms/stats.wall_clock_time_ms << "x\n";
+                  << stats.total_solve_time_ms/stats.wall_clock_time_ms << "x\n"
+                  << "答案与题目详情见answer_parallel.txt\n"
+                  << "====================================\n";
+    }else{
+        std::cout << "答案与题目详情见answer_serial.txt\n"
+                  << "====================================\n";
     }
     
     std::cout << "平均每个问题耗时: " 
               << stats.wall_clock_time_ms/stats.total_problems << " 毫秒\n"
-              << "平均每秒解决问题数: " << std::setprecision(2)
-              << stats.total_problems/(stats.wall_clock_time_ms/1000.0) << " 个/秒\n"
               << "====================================\n";
 }
 
