@@ -138,6 +138,40 @@
     --threads N     设置并行线程数 (默认: 4)
     --file FILE     指定输入文件 (默认: problems.json)
     --help          显示帮助信息
+  ## 测试：
+  ```sh
+  python3 create_problems.py ; make ; ./unified_lp_solver ;./unified_lp_solver --serial
+  ```
+```
+请输入要生成的线性规划问题数量: 50000
+请输入输出文件名(直接回车使用默认文件名 `problems.json`): 
+成功生成 50000 个线性规划问题
+已保存到 problems.json
+g++ -std=c++17 -O2 -Wall -g -pthread -c main.cc -o main.o
+g++ -std=c++17 -O2 -Wall -g -pthread main.o -o unified_lp_solver -pthread
+============ 求解汇总 ============
+模式: 并行 (线程数: 4)
+求解问题总数: 50000
+成功解决的问题数: 4106
+失败的问题数: 45894
+总迭代次数: 80624
+总求解时间(各问题累加): 3427.11 毫秒
+实际总耗时: 981 毫秒
+并行加速比: 3.49x
+答案与题目详情见answer_parallel.txt
+平均每个问题耗时: 0.02 毫秒
+
+============ 求解汇总 ============
+模式: 串行
+求解问题总数: 50000
+成功解决的问题数: 4106
+失败的问题数: 45894
+总迭代次数: 80624
+总求解时间(各问题累加): 2500.79 毫秒
+实际总耗时: 2565 毫秒
+答案与题目详情见answer_serial.txt
+平均每个问题耗时: 0.0513 毫秒
+```
 
   ## 注意事项
 
