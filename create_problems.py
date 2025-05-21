@@ -96,7 +96,7 @@ def generate_lp_problems(num_problems, output_file="problems.json"):
 
 if __name__ == "__main__":
     num_problems = int(input("请输入要生成的线性规划问题数量: "))
-    output_file = input("请输入输出文件名(直接回车使用默认文件名 `problems.json`): ").strip() or "problems.json"
+    output_file = input("文件名 `problems.json`): ").strip() or "problems.json"
     
     problems = generate_lp_problems(num_problems, output_file)
     
